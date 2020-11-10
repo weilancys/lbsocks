@@ -9,7 +9,7 @@ import socket
 
 SOCKS_VERSION = 5
 DEFAULT_PORT = 1080
-FORMAT_SINGLE_OCTET = "!B"
+
 
 class LBSocksServer(ThreadingTCPServer):
     pass
@@ -24,6 +24,7 @@ class SocksTCPHandler(StreamRequestHandler):
 
 
     def recv_all(self, length):
+        """ helper method for recving long data from a stream socket """
         buffer = b''
         bytes_recved = 0
         while bytes_recved < length:
@@ -34,42 +35,91 @@ class SocksTCPHandler(StreamRequestHandler):
 
 
     def recv_auth_negotiation(self):
-        VER, NMETHODS = self.get_octects(self.request.recv(2), 2)
-        assert VER == SOCKS_VERSION
-        print(VER)
-        print(NMETHODS)
+        VER, NMETHODS = struct.unpack("!BB", self.request.recv(2))
 
-        METHODS = self.recv_all(NMETHODS)
+        if VER != SOCKS_VERSION:
+            self.server.shutdown_request()
 
-        # TODO with METHODS
-    
+        METHODS = self.request.recv(NMETHODS)
+
+        client_methods = struct.unpack("!" + NMETHODS * "B", METHODS)
+        print("client methods are:")
+        for method in client_methods:
+            print(method)
+
 
     def reply_auth_negotiation(self):
         # SO FAR WE ONLY SUPPORT NO AUTH (^.^)
         FORMAT = "!BB"
-        packet = struct.pack(FORMAT, SOCKS_VERSION, 0)
-        self.request.sendall(packet)
 
-    
+        # auth modes
+        NO_AUTH = 0x00
+        GSSAPI_AUTH = 0x01
+        USERNAME_PASSWORD_AUTH = 0x02
+        NO_ACCEPTABLE_METHODS = 0xFF
+
+        packet = struct.pack(FORMAT, SOCKS_VERSION, NO_AUTH)
+
+        try:
+            self.request.sendall(packet)
+        except:
+            self.server.shutdown_request()
+        
+
     def recv_request_details(self):
         # SO FAR WE ONLY SUPPORT CONNECT REQUEST AND IPV4 ADDRESS (^.^)
-        VER, CMD, RSV, ATYP = self.get_octects(self.request.recv(4), 4)
+        VER, CMD, RSV, ATYP = struct.unpack("!BBBB", self.request.recv(4))
         
-        assert VER == 5
-        assert CMD == 1
-        assert ATYP == 1
+        if VER != SOCKS_VERSION:
+            self.server.shutdown_request()
 
-        DST_ADDR = socket.inet_ntoa(b''.join(self.get_octects(self.request.recv_all(32), 4)))
-        DST_PORT = socket.ntohs(b''.join(self.get_octects(self.request.recv(2), 2)))
+        if CMD != 1:
+            raise NotImplementedError
+
+        if ATYP == 0x01:
+            # ipv4 ip address
+            DST_ADDR = socket.inet_ntoa(self.request.recv(4))
+            DST_PORT = struct.unpack("!H", self.request.recv(2))
+        elif ATYP == 0x03:
+            # domain name
+            addr_length = struct.unpack("!B", self.request.recv(1))
+            domain_name = "".join(struct.unpack("!" + "c"*addr_length, self.request.recv(addr_length)))
+            DST_ADDR = socket.gethostbyname(domain_name)
+            DST_PORT = struct.unpack("!H", self.request.recv(2))
+        elif ATYP == 0x04:
+            # ipv6 ip address
+            raise NotImplementedError
 
         return DST_ADDR, DST_PORT
 
 
-    def reply_request_details(self):
-        """
-        docstring
-        """
-        pass
+    def reply_request_details(self, bind_addr):
+        FORMAT = "!BBBB4sh"
+
+        VER = SOCKS_VERSION
+        REP = 0
+        RSV = 0
+        ATYP = 1 # ipv4 only for now
+        BND_ADDR = socket.inet_aton(bind_addr[0])
+        DND_PORT = bind_addr[1]
+
+        packet = struct.pack(FORMAT, VER, REP, RSV, ATYP, BND_ADDR, BND_ADDR)
+        self.request.sendall(packet)
+
+
+    def reply_request_failure(self):
+        VER = SOCKS_VERSION
+        REP = 1
+        RSV = 0
+        ATYP = 1 # ipv4 only for now
+        BND_ADDR = 0
+        BND_PORT = 0
+
+        FORMAT = "!BBBBIh"
+
+        packet = struct.pack(FORMAT, VER, REP, RSV, ATYP, BND_ADDR, BND_PORT)
+        self.request.sendall(packet)
+
 
 
     def handle(self):
@@ -77,8 +127,8 @@ class SocksTCPHandler(StreamRequestHandler):
         socks5 server workflow:
 
         NOTES:
-            VER in the following messages are set to 5 as this is socks protocol version 5.
-            All numbers in the following messages are in octets.
+            1. VER in the following messages are set to 5 as this is socks protocol version 5.
+            2. All numbers in the following message diagrams represent the number of octets.
 
         1. client connects to socks5 server (conventionally port 1080)
 
@@ -119,20 +169,18 @@ class SocksTCPHandler(StreamRequestHandler):
             | 1  |  1  | X'00' |  1   | Variable |    2     |
             +----+-----+-------+------+----------+----------+
 
-            Where:
-                o  VER  protocol version: X'05'
-                o  CMD
-                    o  CONNECT X'01'
-                    o  BIND X'02'
-                    o  UDP ASSOCIATE X'03'
-                o  RSV    RESERVED
-                o  ATYP   address type of following address
-                    o  IP V4 address: X'01'
-                    o  DOMAINNAME: X'03'
-                    o  IP V6 address: X'04'
-                o  DST.ADDR       desired destination address
-                o  DST.PORT desired destination port in network octet
-                    order
+            o  VER  protocol version: X'05'
+            o  CMD
+                o  CONNECT X'01'
+                o  BIND X'02'
+                o  UDP ASSOCIATE X'03'
+            o  RSV    RESERVED
+            o  ATYP   address type of following address
+                o  IP V4 address: X'01'
+                o  DOMAINNAME: X'03'
+                o  IP V6 address: X'04'
+            o  DST.ADDR       desired destination address
+            o  DST.PORT desired destination port in network octet order
 
         6. server evaluates the request and returns a reply formed as follows:
 
@@ -142,42 +190,65 @@ class SocksTCPHandler(StreamRequestHandler):
             | 1  |  1  | X'00' |  1   | Variable |    2     |
             +----+-----+-------+------+----------+----------+
 
-            Where:
+            o  VER    protocol version: X'05'
+            o  REP    Reply field:
+                o  X'00' succeeded
+                o  X'01' general SOCKS server failure
+                o  X'02' connection not allowed by ruleset
+                o  X'03' Network unreachable
+                o  X'04' Host unreachable
+                o  X'05' Connection refused
+                o  X'06' TTL expired
+                o  X'07' Command not supported
+                o  X'08' Address type not supported
+                o  X'09' to X'FF' unassigned
+            o  RSV    RESERVED
+            o  ATYP   address type of following address
 
-                o  VER    protocol version: X'05'
-                o  REP    Reply field:
-                    o  X'00' succeeded
-                    o  X'01' general SOCKS server failure
-                    o  X'02' connection not allowed by ruleset
-                    o  X'03' Network unreachable
-                    o  X'04' Host unreachable
-                    o  X'05' Connection refused
-                    o  X'06' TTL expired
-                    o  X'07' Command not supported
-                    o  X'08' Address type not supported
-                    o  X'09' to X'FF' unassigned
-                o  RSV    RESERVED
-                o  ATYP   address type of following address
-
-        7. 
+        7. commnication
         """
         
         self.recv_auth_negotiation()
         self.reply_auth_negotiation()
 
         dst_addr = self.recv_request_details()
-        
-        remote_socket = socket.socket()
-        remote_socket.connect(dst_addr)
 
-        # address of local socket connected with remote host
-        bind_addr = remote_socket.getsockname()
+        print(dst_addr)
+        
+        # try:
+        #     remote_socket = socket.socket()
+        #     remote_socket.connect(dst_addr)
+
+        #     # address of local socket connected with remote host
+        #     bind_addr = remote_socket.getsockname()
+        #     self.reply_request_details(bind_addr)
+
+        #     selector = selectors.DefaultSelector()
+        #     selector.register(remote_socket, selectors.EVENT_READ, None)
+        #     selector.register(self.connection, selectors.EVENT_READ, None)
+
+        #     while True:
+        #         events = selector.select()
+        #         for key, event in events:
+        #             sock = key.fileobj
+        #             if sock is remote_socket:
+        #                 chunk = sock.recv(4096)
+        #                 if self.connection.sendall(chunk) <= 0:
+        #                     break
+        #             elif sock is self.connection:
+        #                 chunk = sock.recv(4096)
+        #                 if remote_socket.sendall(chunk) <= 0:
+        #                     break
+
+        #     selector.close()
+        # except:
+        #     self.reply_request_failure()
 
 
 
 
 if __name__ == "__main__":
-    addr = ("0.0.0.0", DEFAULT_PORT)
+    addr = ("0.0.0.0", 7777)
     with LBSocksServer(addr, SocksTCPHandler) as server:
         try:
             server.serve_forever()
