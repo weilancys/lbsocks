@@ -23,7 +23,7 @@ class SocksTCPHandler(StreamRequestHandler):
         return octets
 
 
-    def recv_all(self, length):
+    def recvall(self, length):
         """ helper method for recving long data from a stream socket """
         buffer = b''
         bytes_recved = 0
@@ -35,7 +35,9 @@ class SocksTCPHandler(StreamRequestHandler):
 
 
     def recv_auth_negotiation(self):
-        VER, NMETHODS = struct.unpack("!BB", self.request.recv(2))
+        # VER, NMETHODS = struct.unpack("!BB", self.request.recv(2))
+        VER, NMETHODS = struct.unpack("!BB", self.recvall(2))
+        
 
         if VER != SOCKS_VERSION:
             self.server.shutdown_request()
@@ -79,13 +81,13 @@ class SocksTCPHandler(StreamRequestHandler):
         if ATYP == 0x01:
             # ipv4 ip address
             DST_ADDR = socket.inet_ntoa(self.request.recv(4))
-            DST_PORT = struct.unpack("!H", self.request.recv(2))
+            DST_PORT = struct.unpack("!H", self.request.recv(2))[0]
         elif ATYP == 0x03:
             # domain name
             addr_length = struct.unpack("!B", self.request.recv(1))
             domain_name = "".join(struct.unpack("!" + "c"*addr_length, self.request.recv(addr_length)))
             DST_ADDR = socket.gethostbyname(domain_name)
-            DST_PORT = struct.unpack("!H", self.request.recv(2))
+            DST_PORT = struct.unpack("!H", self.request.recv(2))[0]
         elif ATYP == 0x04:
             # ipv6 ip address
             raise NotImplementedError
@@ -94,17 +96,21 @@ class SocksTCPHandler(StreamRequestHandler):
 
 
     def reply_request_details(self, bind_addr):
-        FORMAT = "!BBBB4sh"
+        FORMAT = "!BBBB4sH"
 
         VER = SOCKS_VERSION
         REP = 0
         RSV = 0
         ATYP = 1 # ipv4 only for now
         BND_ADDR = socket.inet_aton(bind_addr[0])
-        DND_PORT = bind_addr[1]
+        BND_PORT = bind_addr[1]
 
-        packet = struct.pack(FORMAT, VER, REP, RSV, ATYP, BND_ADDR, BND_ADDR)
-        self.request.sendall(packet)
+        packet = struct.pack(FORMAT, VER, REP, RSV, ATYP, BND_ADDR, BND_PORT)
+
+        try:
+            self.request.sendall(packet)
+        except:
+            self.server.shutdown_request()
 
 
     def reply_request_failure(self):
@@ -210,40 +216,53 @@ class SocksTCPHandler(StreamRequestHandler):
         
         self.recv_auth_negotiation()
         self.reply_auth_negotiation()
-
         dst_addr = self.recv_request_details()
 
         print(dst_addr)
         
-        # try:
-        #     remote_socket = socket.socket()
-        #     remote_socket.connect(dst_addr)
+        try:
+            remote_socket = socket.socket()
+            remote_socket.connect(dst_addr)
 
-        #     # address of local socket connected with remote host
-        #     bind_addr = remote_socket.getsockname()
-        #     self.reply_request_details(bind_addr)
+            # address of local socket connected with remote host
+            bind_addr = remote_socket.getsockname()
+            self.reply_request_details(bind_addr)
 
-        #     selector = selectors.DefaultSelector()
-        #     selector.register(remote_socket, selectors.EVENT_READ, None)
-        #     selector.register(self.connection, selectors.EVENT_READ, None)
+            selector = selectors.DefaultSelector()
+            selector.register(remote_socket, selectors.EVENT_READ, None)
+            selector.register(self.connection, selectors.EVENT_READ, None)
 
-        #     while True:
-        #         events = selector.select()
-        #         for key, event in events:
-        #             sock = key.fileobj
-        #             if sock is remote_socket:
-        #                 chunk = sock.recv(4096)
-        #                 if self.connection.sendall(chunk) <= 0:
-        #                     break
-        #             elif sock is self.connection:
-        #                 chunk = sock.recv(4096)
-        #                 if remote_socket.sendall(chunk) <= 0:
-        #                     break
+            print("finished adding selector keys...")
 
-        #     selector.close()
-        # except:
-        #     self.reply_request_failure()
-
+            selecting = True
+            while selecting:
+                events = selector.select()
+                for key, event in events:
+                    sock = key.fileobj
+                    if sock is remote_socket:
+                        chunk = sock.recv(4096)
+                        try:
+                            self.connection.sendall(chunk)
+                            print("sending to client...")
+                        except:
+                            selecting = False
+                            break
+                    elif sock is self.connection:
+                        chunk = sock.recv(4096)
+                        try:
+                            remote_socket.sendall(chunk)
+                            print("sending to server...")
+                        except:
+                            selecting = False
+                            break
+            selector.close()
+        except:
+            raise
+            # self.reply_request_failure()
+            # print("request failure sent")
+        finally:
+            remote_socket.close()
+            self.server.shutdown_request()
 
 
 
