@@ -28,22 +28,24 @@ class SocksTCPHandler(StreamRequestHandler):
         buffer = b''
         bytes_recved = 0
         while bytes_recved < length:
-            chunk = self.request.recv(min(512, length - bytes_recved))
-            bytes_recved += len(chunk)
-            buffer += chunk
+            try:
+                chunk = self.request.recv(min(512, length - bytes_recved))
+                if not chunk:
+                    raise ConnectionResetError("connection reset by peer")
+                bytes_recved += len(chunk)
+                buffer += chunk
+            except Exception as e:
+                self.server.shutdown_request(self.request)
+                print(str(e))
+                break
         return buffer
 
 
     def recv_auth_negotiation(self):
-        # VER, NMETHODS = struct.unpack("!BB", self.request.recv(2))
         VER, NMETHODS = struct.unpack("!BB", self.recvall(2))
-        
-
         if VER != SOCKS_VERSION:
-            self.server.shutdown_request()
-
+            self.server.shutdown_request(self.request)
         METHODS = self.request.recv(NMETHODS)
-
         client_methods = struct.unpack("!" + NMETHODS * "B", METHODS)
         print("client methods are:")
         for method in client_methods:
@@ -65,15 +67,15 @@ class SocksTCPHandler(StreamRequestHandler):
         try:
             self.request.sendall(packet)
         except:
-            self.server.shutdown_request()
+            self.server.shutdown_request(self.request)
         
 
     def recv_request_details(self):
         # SO FAR WE ONLY SUPPORT CONNECT REQUEST AND IPV4 ADDRESS (^.^)
-        VER, CMD, RSV, ATYP = struct.unpack("!BBBB", self.request.recv(4))
+        VER, CMD, RSV, ATYP = struct.unpack("!BBBB", self.recvall(4))
         
         if VER != SOCKS_VERSION:
-            self.server.shutdown_request()
+            self.server.shutdown_request(self.request)
 
         if CMD != 1:
             raise NotImplementedError
@@ -110,7 +112,7 @@ class SocksTCPHandler(StreamRequestHandler):
         try:
             self.request.sendall(packet)
         except:
-            self.server.shutdown_request()
+            self.server.shutdown_request(self.request)
 
 
     def reply_request_failure(self):
@@ -121,10 +123,14 @@ class SocksTCPHandler(StreamRequestHandler):
         BND_ADDR = 0
         BND_PORT = 0
 
-        FORMAT = "!BBBBIh"
+        FORMAT = "!BBBBIH"
 
         packet = struct.pack(FORMAT, VER, REP, RSV, ATYP, BND_ADDR, BND_PORT)
-        self.request.sendall(packet)
+
+        try:
+            self.request.sendall(packet)
+        except:
+            self.server.shutdown_request(self.request)
 
 
 
@@ -216,54 +222,50 @@ class SocksTCPHandler(StreamRequestHandler):
         
         self.recv_auth_negotiation()
         self.reply_auth_negotiation()
-        dst_addr = self.recv_request_details()
 
-        print(dst_addr)
+        dst_addr = self.recv_request_details()
         
         try:
             remote_socket = socket.socket()
             remote_socket.connect(dst_addr)
+        except:
+            self.reply_request_failure()
+            self.server.shutdown_request(self.request)
 
-            # address of local socket connected with remote host
-            bind_addr = remote_socket.getsockname()
-            self.reply_request_details(bind_addr)
+        # address of local socket connected with remote host
+        bind_addr = remote_socket.getsockname()
+        self.reply_request_details(bind_addr)
 
-            selector = selectors.DefaultSelector()
-            selector.register(remote_socket, selectors.EVENT_READ, None)
-            selector.register(self.connection, selectors.EVENT_READ, None)
+        selector = selectors.DefaultSelector()
+        selector.register(remote_socket, selectors.EVENT_READ, None)
+        selector.register(self.connection, selectors.EVENT_READ, None)
 
-            print("finished adding selector keys...")
-
-            selecting = True
-            while selecting:
-                events = selector.select()
-                for key, event in events:
-                    sock = key.fileobj
+        selecting = True
+        while selecting:
+            events = selector.select()
+            for key, event in events:
+                sock = key.fileobj
+                try:
                     if sock is remote_socket:
                         chunk = sock.recv(4096)
-                        try:
-                            self.connection.sendall(chunk)
-                            print("sending to client...")
-                        except:
-                            selecting = False
-                            break
+                        if not chunk:
+                            raise ConnectionResetError("connection reset by peer")
+                        self.connection.sendall(chunk)
+                        print("sending to client...")
                     elif sock is self.connection:
                         chunk = sock.recv(4096)
-                        try:
-                            remote_socket.sendall(chunk)
-                            print("sending to server...")
-                        except:
-                            selecting = False
-                            break
-            selector.close()
-        except:
-            raise
-            # self.reply_request_failure()
-            # print("request failure sent")
-        finally:
-            remote_socket.close()
-            self.server.shutdown_request()
-
+                        if not chunk:
+                            raise ConnectionResetError("connection reset by peer")
+                        remote_socket.sendall(chunk)
+                        print("sending to server...")
+                except Exception as e:
+                    print(str(e))
+                    selecting = False
+                    break
+                        
+        selector.close()
+        remote_socket.close()
+        self.server.shutdown_request(self.request)
 
 
 if __name__ == "__main__":
