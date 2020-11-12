@@ -2,6 +2,8 @@ from socketserver import StreamRequestHandler, ThreadingTCPServer
 import selectors
 import struct
 import socket
+import logging
+import sys
 
 # RFC 1928 reference: 
 # https://www.ietf.org/rfc/rfc1928.txt
@@ -10,13 +12,16 @@ import socket
 SOCKS_VERSION = 5
 DEFAULT_PORT = 1080
 
+# logger config
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(message)s")
+
 
 class LBSocksServer(ThreadingTCPServer):
     pass
 
 
 class SocksTCPHandler(StreamRequestHandler):
-    def get_octects(self, buffer, num):
+    def get_octets(self, buffer, num):
         """ convert bytes received from network to octets. octets are returned in a tuple. """
         FORMAT = "!" + "B" * num
         octets = struct.unpack(FORMAT, buffer)
@@ -36,7 +41,7 @@ class SocksTCPHandler(StreamRequestHandler):
                 buffer += chunk
             except Exception as e:
                 self.server.shutdown_request(self.request)
-                print(str(e))
+                logging.exception(e)
                 break
         return buffer
 
@@ -45,40 +50,35 @@ class SocksTCPHandler(StreamRequestHandler):
         VER, NMETHODS = struct.unpack("!BB", self.recvall(2))
         if VER != SOCKS_VERSION:
             self.server.shutdown_request(self.request)
-        METHODS = self.request.recv(NMETHODS)
+        METHODS = self.recvall(NMETHODS)
         client_methods = struct.unpack("!" + NMETHODS * "B", METHODS)
-        print("client methods are:")
-        for method in client_methods:
-            print(method)
+
+        # TODO auth here
 
 
     def reply_auth_negotiation(self):
-        # SO FAR WE ONLY SUPPORT NO AUTH (^.^)
-        FORMAT = "!BB"
-
         # auth modes
         NO_AUTH = 0x00
-        GSSAPI_AUTH = 0x01
-        USERNAME_PASSWORD_AUTH = 0x02
+        GSSAPI = 0x01
+        USERNAME_PASSWORD = 0x02
         NO_ACCEPTABLE_METHODS = 0xFF
 
-        packet = struct.pack(FORMAT, SOCKS_VERSION, NO_AUTH)
-
+        packet = struct.pack("!BB", SOCKS_VERSION, NO_AUTH) # only no auth supported so far
         try:
             self.request.sendall(packet)
-        except:
+        except Exception as e:
+            logging.exception(e)
             self.server.shutdown_request(self.request)
         
 
     def recv_request_details(self):
-        # SO FAR WE ONLY SUPPORT CONNECT REQUEST AND IPV4 ADDRESS (^.^)
         VER, CMD, RSV, ATYP = struct.unpack("!BBBB", self.recvall(4))
         
         if VER != SOCKS_VERSION:
             self.server.shutdown_request(self.request)
 
-        if CMD != 1:
-            raise NotImplementedError
+        if CMD != 0x01:
+            raise NotImplementedError # only connect cmd supported so far
 
         if ATYP == 0x01:
             # ipv4 ip address
@@ -111,25 +111,25 @@ class SocksTCPHandler(StreamRequestHandler):
 
         try:
             self.request.sendall(packet)
-        except:
+        except Exception as e:
+            logging.exception(e)
             self.server.shutdown_request(self.request)
 
 
     def reply_request_failure(self):
         VER = SOCKS_VERSION
-        REP = 1
+        REP = 1 # general socks server failure
         RSV = 0
         ATYP = 1 # ipv4 only for now
         BND_ADDR = 0
         BND_PORT = 0
 
         FORMAT = "!BBBBIH"
-
         packet = struct.pack(FORMAT, VER, REP, RSV, ATYP, BND_ADDR, BND_PORT)
-
         try:
             self.request.sendall(packet)
-        except:
+        except Exception as e:
+            logging.exception(e)
             self.server.shutdown_request(self.request)
 
 
@@ -228,11 +228,11 @@ class SocksTCPHandler(StreamRequestHandler):
         try:
             remote_socket = socket.socket()
             remote_socket.connect(dst_addr)
-        except:
+        except Exception as e:
+            logging.exception(e)
             self.reply_request_failure()
             self.server.shutdown_request(self.request)
 
-        # address of local socket connected with remote host
         bind_addr = remote_socket.getsockname()
         self.reply_request_details(bind_addr)
 
@@ -251,15 +251,15 @@ class SocksTCPHandler(StreamRequestHandler):
                         if not chunk:
                             raise ConnectionResetError("connection reset by peer")
                         self.connection.sendall(chunk)
-                        print("sending to client...")
+                        logging.info(f"sending {len(chunk)} bytes to client {self.client_address[0]}:{self.client_address[1]}")
                     elif sock is self.connection:
                         chunk = sock.recv(4096)
                         if not chunk:
                             raise ConnectionResetError("connection reset by peer")
                         remote_socket.sendall(chunk)
-                        print("sending to server...")
+                        logging.info(f"sending {len(chunk)} bytes to remote server {dst_addr[0]}:{dst_addr[1]}")
                 except Exception as e:
-                    print(str(e))
+                    logging.exception(e)
                     selecting = False
                     break
                         
@@ -269,7 +269,7 @@ class SocksTCPHandler(StreamRequestHandler):
 
 
 if __name__ == "__main__":
-    addr = ("0.0.0.0", 7777)
+    addr = ("0.0.0.0", DEFAULT_PORT + 1)
     with LBSocksServer(addr, SocksTCPHandler) as server:
         try:
             server.serve_forever()
